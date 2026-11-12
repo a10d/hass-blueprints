@@ -1,0 +1,260 @@
+blueprint:
+  name: Smart light switch (presence + night mode)
+  description: >
+    Turns a pair of on/off buttons into a smart light switch for one area.
+
+
+    **Behaviour**
+
+    - **On button**: turns on all lights in the area. While night mode is on,
+    only the night lights are turned on.
+
+    - **Off button**: turns off all lights (area + night lights).
+
+    - **Presence**: when presence is detected and the lights are off, the area
+    lights are turned on. Not while night mode is on, and not within the block
+    period (default 30 min) after the lights were switched off by hand.
+
+    - **Auto off**: lights turned on by presence go off after a short time
+    without presence (default 1 min). Lights turned on by hand (button, app,
+    voice …) go off after a longer time without presence (default 10 min).
+
+
+    The automation keeps its state in its own run (mode: restart), so no
+    helpers are needed. A Home Assistant restart clears the block period;
+    lights that are on at start-up are treated as switched on by hand.
+  domain: automation
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    switch_section:
+      name: Light switch
+      icon: mdi:light-switch
+      input:
+        on_button:
+          name: On button
+          description: >
+            What counts as pressing "on", e.g. a device trigger
+            ("Button 1 short press"), an event entity or an MQTT trigger.
+            You can add several triggers.
+          selector:
+            trigger: {}
+        off_button:
+          name: Off button
+          description: What counts as pressing "off". You can add several triggers.
+          selector:
+            trigger: {}
+    lights_section:
+      name: Lights
+      icon: mdi:lightbulb-group
+      input:
+        light_area:
+          name: Area
+          description: All lights in this area are switched.
+          selector:
+            area:
+              entity:
+                - domain: light
+        night_lights:
+          name: Night lights
+          description: >
+            Lights the on button turns on while night mode is on. They may be
+            outside the area; the off button and auto off switch them off too.
+            Leave empty to use all area lights in night mode as well.
+          default: []
+          selector:
+            entity:
+              filter:
+                - domain: light
+              multiple: true
+    presence_section:
+      name: Presence and night mode
+      icon: mdi:motion-sensor
+      input:
+        presence_sensor:
+          name: Presence sensor
+          description: >
+            Binary sensor that is "on" while someone is in the room. To use
+            several sensors, combine them in a binary sensor group helper.
+          selector:
+            entity:
+              filter:
+                - domain: binary_sensor
+        night_mode:
+          name: Night mode (optional)
+          description: >
+            While this entity is "on", presence does not turn on the lights and
+            the on button only turns on the night lights.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain:
+                    - input_boolean
+                    - switch
+                    - binary_sensor
+    timing_section:
+      name: Timing
+      icon: mdi:timer-outline
+      collapsed: true
+      input:
+        manual_off_delay:
+          name: Off after no presence (switched on by hand)
+          description: Lights switched on by hand go off after this long without presence.
+          default:
+            minutes: 10
+          selector:
+            duration: {}
+        auto_off_delay:
+          name: Off after no presence (switched on by presence)
+          description: Lights switched on by presence go off after this long without presence.
+          default:
+            minutes: 1
+          selector:
+            duration: {}
+        block_after_off:
+          name: Presence block after switching off by hand
+          description: >
+            After the lights are switched off by hand, presence does not turn
+            them on again for this long.
+          default:
+            minutes: 30
+          selector:
+            duration: {}
+
+mode: restart
+max_exceeded: silent
+
+trigger_variables:
+  t_area: !input light_area
+  t_night_lights: !input night_lights
+
+# Order matters: the on-button triggers come first, then the off-button triggers.
+# Home Assistant flattens them into the list and they cannot carry an ID, so the
+# automation tells them apart by their index (see `kind` below).
+triggers:
+  - triggers: !input on_button
+  - triggers: !input off_button
+  - trigger: state
+    entity_id: !input presence_sensor
+    to: "on"
+    id: presence
+  # Lights went from all off to on by some other means (app, voice, scene …)
+  - trigger: template
+    value_template: >-
+      {{ (area_entities(t_area) | select('match', 'light[.]') | list + t_night_lights)
+         | select('is_state', 'on') | list | count > 0 }}
+    id: lights_on
+  - trigger: homeassistant
+    event: start
+    id: startup
+  - trigger: event
+    event_type: automation_reloaded
+    id: startup
+
+variables:
+  on_button_triggers: !input on_button
+  light_area: !input light_area
+  night_lights: !input night_lights
+  presence_sensor: !input presence_sensor
+  night_mode_entity: !input night_mode
+  manual_off_delay: !input manual_off_delay
+  auto_off_delay: !input auto_off_delay
+  area_lights: "{{ area_entities(light_area) | select('match', 'light[.]') | list }}"
+  all_lights: "{{ (area_lights + night_lights) | unique | list }}"
+  night_on_lights: "{{ night_lights if night_lights | count > 0 else area_lights }}"
+  night_active: "{{ night_mode_entity not in ['', none] and is_state(night_mode_entity, 'on') }}"
+  # True when no earlier run of this automation is still active. A run stays
+  # active while it manages lights that are on, and during the presence block
+  # after switching off by hand.
+  idle: "{{ (this.attributes.current | default(0) | int(0)) == 0 }}"
+  kind: >-
+    {%- if trigger.id in ['presence', 'lights_on', 'startup'] -%}
+      {{ trigger.id }}
+    {%- elif (trigger.idx | int(0)) < (on_button_triggers | count) -%}
+      on
+    {%- else -%}
+      off
+    {%- endif -%}
+
+conditions:
+  - condition: template
+    value_template: >-
+      {%- if kind in ['on', 'off'] -%}
+        true
+      {%- elif kind == 'presence' -%}
+        {{ idle and not night_active }}
+      {%- else -%}
+        {{ idle and all_lights | select('is_state', 'on') | list | count > 0 }}
+      {%- endif -%}
+
+actions:
+  # 1) Act on the trigger
+  - choose:
+      - conditions: "{{ kind == 'off' }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ all_lights }}"
+          - wait_template: "{{ all_lights | select('is_state', 'on') | list | count == 0 }}"
+            timeout: 5
+      - conditions: "{{ kind in ['on', 'presence'] }}"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: "{{ night_on_lights if (kind == 'on' and night_active) else area_lights }}"
+          - wait_template: "{{ all_lights | select('is_state', 'on') | list | count > 0 }}"
+            timeout: 5
+          - if: "{{ all_lights | select('is_state', 'on') | list | count == 0 }}"
+            then:
+              - stop: Lights did not turn on
+
+  # 2) Loop until the run ends with a 'stop':
+  #    a) lights on  -> wait for no presence, then turn them off and stop
+  #    b) lights were switched off by hand -> block presence for a while, then stop
+  #       (if they are switched on by hand during the block, go back to a)
+  - repeat:
+      until: "{{ false }}"
+      sequence:
+        - variables:
+            off_delay: "{{ auto_off_delay if (kind == 'presence' and repeat.index == 1) else manual_off_delay }}"
+        - repeat:
+            while: "{{ all_lights | select('is_state', 'on') | list | count > 0 }}"
+            sequence:
+              # Someone is present: wait until they leave (or the lights are switched off)
+              - if:
+                  - condition: state
+                    entity_id: !input presence_sensor
+                    state: "on"
+                then:
+                  - wait_for_trigger:
+                      - trigger: state
+                        entity_id: !input presence_sensor
+                        not_to: "on"
+                      - trigger: template
+                        value_template: "{{ all_lights | select('is_state', 'on') | list | count == 0 }}"
+              # Nobody present: count down, start over if presence comes back
+              - if: "{{ all_lights | select('is_state', 'on') | list | count > 0 and not is_state(presence_sensor, 'on') }}"
+                then:
+                  - wait_for_trigger:
+                      - trigger: state
+                        entity_id: !input presence_sensor
+                        to: "on"
+                      - trigger: template
+                        value_template: "{{ all_lights | select('is_state', 'on') | list | count == 0 }}"
+                    timeout: "{{ off_delay }}"
+                  - if: "{{ wait.trigger is none }}"
+                    then:
+                      - action: light.turn_off
+                        target:
+                          entity_id: "{{ all_lights }}"
+                      - stop: No presence, lights turned off
+        # The lights were switched off by hand: keep this run alive so presence
+        # is ignored (see 'idle') until the block period is over.
+        - wait_for_trigger:
+            - trigger: template
+              value_template: "{{ all_lights | select('is_state', 'on') | list | count > 0 }}"
+          timeout: !input block_after_off
+        - if: "{{ wait.trigger is none and all_lights | select('is_state', 'on') | list | count == 0 }}"
+          then:
+            - stop: Presence block ended
